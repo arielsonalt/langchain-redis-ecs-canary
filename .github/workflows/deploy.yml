@@ -1,0 +1,76 @@
+name: build-and-deploy-canary
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: langchain-redis-api
+
+  ECS_CLUSTER: your-ecs-cluster
+  ECS_SERVICE: your-ecs-service
+
+  CODEDEPLOY_APP: your-codedeploy-app
+  CODEDEPLOY_DG: your-codedeploy-deployment-group
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image
+        run: |
+          IMAGE_URI="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      - name: Render task definition
+        run: |
+          chmod +x scripts/render-taskdef.sh
+          export IMAGE_URI="${IMAGE_URI}"
+          export ECS_EXECUTION_ROLE_ARN="${{ secrets.ECS_EXECUTION_ROLE_ARN }}"
+          export ECS_TASK_ROLE_ARN="${{ secrets.ECS_TASK_ROLE_ARN }}"
+          export OPENAI_API_KEY_SECRET_ARN="${{ secrets.OPENAI_API_KEY_SECRET_ARN }}"
+          export REDIS_URL_SECRET_ARN="${{ secrets.REDIS_URL_SECRET_ARN }}"
+          scripts/render-taskdef.sh
+          cat taskdef.rendered.json
+
+      - name: Register task definition
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.rendered.json \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+
+      - name: Create CodeDeploy deployment (canary 10%)
+        run: |
+          # Substitui o placeholder do AppSpec pelo ARN real
+          sed "s|TASK_DEFINITION_ARN|${TASK_DEF_ARN}|g" appspec.yaml > appspec.rendered.yaml
+
+          REVISION_JSON=$(jq -n --arg content "$(base64 -w0 appspec.rendered.yaml)" '{
+            revisionType: "AppSpecContent",
+            appSpecContent: { content: $content }
+          }')
+
+          aws deploy create-deployment \
+            --application-name "${{ env.CODEDEPLOY_APP }}" \
+            --deployment-group-name "${{ env.CODEDEPLOY_DG }}" \
+            --revision "$REVISION_JSON" \
+            --description "Canary 10% deploy - ${{ github.sha }}"
